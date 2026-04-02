@@ -1,0 +1,16 @@
+SyncComms - Replay Audio Sync
+1|Enable SyncComms|synccomms_enabled
+9|Capture
+0|Arm Recording|synccomms_start_capture
+7
+0|Stop Recording|synccomms_stop_capture
+9|Audio Source
+6|Target Process|synccomms_target_process|System Audio (All)@
+0|Refresh Process List|synccomms_refresh_audio_processes
+1|Include Microphone|synccomms_include_mic
+9|Playback Settings
+4|Volume|synccomms_volume|0|2
+3|Latency Offset (ms)|synccomms_latency_offset_ms|-500|500
+9|Advanced
+5|Sample Rate|synccomms_sample_rate|8000|96000
+5|Channels|synccomms_channels|1|2
