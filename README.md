@@ -54,7 +54,7 @@ Audio is automatically segmented around goals, compressed to OGG, and stored alo
 ## Building from Source
 
 ```bash
-git clone --recurse-submodules https://github.com/<you>/CommSyncRL.git
+git clone --recurse-submodules https://github.com/acroticguy/CommSyncRL.git
 cd CommSyncRL
 
 cmake -B build -G "Visual Studio 17 2022" -A x64
