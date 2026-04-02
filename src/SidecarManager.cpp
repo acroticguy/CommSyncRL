@@ -49,6 +49,9 @@ bool SidecarManager::WriteSidecar(const std::string& replayId, const std::vector
         s["durationSeconds"] = (seg.endFrame - seg.startFrame) * seg.frameTime;
         s["startTimeSec"] = seg.startTimeSec;
         s["endTimeSec"] = seg.endTimeSec;
+        if (!seg.audioData.empty()) {
+            s["audioData"] = seg.audioData;
+        }
         segsJson.push_back(s);
     }
     j["segments"] = segsJson;
@@ -105,6 +108,7 @@ std::vector<SegmentInfo> SidecarManager::ReadSidecar(const std::string& filePath
         seg.startTimeSec = s.value("startTimeSec", 0.0);
         seg.endTimeSec   = s.value("endTimeSec", 0.0);
         seg.audioFile    = s.value("audioFile", "");
+        seg.audioData    = s.value("audioData", "");
         seg.event        = s.value("event", "");
         segments.push_back(seg);
     }
@@ -200,49 +204,24 @@ void SidecarManager::CompressSegments(const std::string& replayId, std::vector<S
             continue;
         }
 
-        // Write OGG file alongside the WAV
-        std::string oggFilename = seg.audioFile;
-        // Replace .wav with .ogg
-        size_t dotPos = oggFilename.rfind(".wav");
-        if (dotPos != std::string::npos) {
-            oggFilename.replace(dotPos, 4, ".ogg");
-        } else {
-            oggFilename += ".ogg";
-        }
-
-        std::string oggPath = outputDir + oggFilename;
-        std::ofstream out(oggPath, std::ios::binary);
-        if (!out.is_open()) {
-            allSucceeded = false;
-            continue;
-        }
-        out.write(reinterpret_cast<const char*>(oggData.data()), oggData.size());
-        out.close();
+        // Embed as base64 in the segment
+        seg.audioData = AudioCompressor::Base64Encode(oggData);
 
         if (m_cvarManager) {
             float ratio = static_cast<float>(std::filesystem::file_size(wavPath)) /
                           static_cast<float>(oggData.size());
             m_cvarManager->log("SyncComms: Compressed " + seg.audioFile +
-                               " -> " + oggFilename + " (" + std::to_string(ratio) + "x)");
+                               " (" + std::to_string(ratio) + "x, embedded)");
         }
-
-        // Update the segment reference to point to the OGG file
-        seg.audioFile = oggFilename;
     }
 
-    // Rewrite sidecar with updated filenames
+    // Rewrite sidecar with embedded audio
     WriteSidecar(replayId, segments);
 
     // Delete WAV files on success
     if (allSucceeded) {
         for (const auto& seg : segments) {
-            // The audioFile now points to .ogg, so build the old .wav name
-            std::string oggPath = outputDir + seg.audioFile;
-            std::string wavPath = oggPath;
-            size_t dotPos = wavPath.rfind(".ogg");
-            if (dotPos != std::string::npos) {
-                wavPath.replace(dotPos, 4, ".wav");
-            }
+            std::string wavPath = outputDir + seg.audioFile;
             std::filesystem::remove(wavPath);
         }
     }

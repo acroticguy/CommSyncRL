@@ -41,6 +41,7 @@ private:
     bool InitPlaybackDevice();
     void DestroyPlaybackDevice();
     bool OpenDecoder(const std::string& audioFile);
+    bool OpenDecoderFromMemory(const std::vector<uint8_t>& oggData);
     void CloseDecoder();
 
     /// Find which segment index should be playing at the given replay time. Returns -1 if none.
@@ -69,6 +70,9 @@ private:
     float         m_segmentStartReplayTime = 0.0f;
     std::atomic<int64_t> m_targetSample{0};
     int64_t       m_decoderPosition = 0;
+
+    // Memory buffer for embedded audio (must outlive decoder)
+    std::vector<uint8_t> m_decoderBuffer;
 
     // Pause detection
     float         m_lastReplayTime  = -1.0f;
