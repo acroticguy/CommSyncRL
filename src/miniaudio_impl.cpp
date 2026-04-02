@@ -11,4 +11,4 @@
 
 // Now include the full stb_vorbis implementation
 #undef STB_VORBIS_HEADER_ONLY
-#include "stb_vorbis.c"
+#include "stb_vorbis.c" // from external/stb_vorbis.c

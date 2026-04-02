@@ -58,6 +58,7 @@ add_library(SyncComms SHARED ${SOURCES})
 
 target_include_directories(SyncComms PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/external          # stb_vorbis.c
     ${CMAKE_CURRENT_SOURCE_DIR}/external/miniaudio
     ${CMAKE_CURRENT_SOURCE_DIR}/external/json/single_include/nlohmann
     ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui
