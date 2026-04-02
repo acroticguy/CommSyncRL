@@ -26,27 +26,27 @@ set(SOURCES
     src/AudioCompressor.cpp
     external/libogg/src/bitwise.c
     external/libogg/src/framing.c
-    external/libvorbis/src/analysis.c
-    external/libvorbis/src/bitrate.c
-    external/libvorbis/src/block.c
-    external/libvorbis/src/codebook.c
-    external/libvorbis/src/envelope.c
-    external/libvorbis/src/floor0.c
-    external/libvorbis/src/floor1.c
-    external/libvorbis/src/info.c
-    external/libvorbis/src/lookup.c
-    external/libvorbis/src/lpc.c
-    external/libvorbis/src/lsp.c
-    external/libvorbis/src/mapping0.c
-    external/libvorbis/src/mdct.c
-    external/libvorbis/src/psy.c
-    external/libvorbis/src/registry.c
-    external/libvorbis/src/res0.c
-    external/libvorbis/src/sharedbook.c
-    external/libvorbis/src/smallft.c
-    external/libvorbis/src/synthesis.c
-    external/libvorbis/src/vorbisenc.c
-    external/libvorbis/src/window.c
+    external/libvorbis/lib/analysis.c
+    external/libvorbis/lib/bitrate.c
+    external/libvorbis/lib/block.c
+    external/libvorbis/lib/codebook.c
+    external/libvorbis/lib/envelope.c
+    external/libvorbis/lib/floor0.c
+    external/libvorbis/lib/floor1.c
+    external/libvorbis/lib/info.c
+    external/libvorbis/lib/lookup.c
+    external/libvorbis/lib/lpc.c
+    external/libvorbis/lib/lsp.c
+    external/libvorbis/lib/mapping0.c
+    external/libvorbis/lib/mdct.c
+    external/libvorbis/lib/psy.c
+    external/libvorbis/lib/registry.c
+    external/libvorbis/lib/res0.c
+    external/libvorbis/lib/sharedbook.c
+    external/libvorbis/lib/smallft.c
+    external/libvorbis/lib/synthesis.c
+    external/libvorbis/lib/vorbisenc.c
+    external/libvorbis/lib/window.c
     external/imgui/imgui.cpp
     external/imgui/imgui_draw.cpp
     external/imgui/imgui_tables.cpp
@@ -59,12 +59,13 @@ add_library(SyncComms SHARED ${SOURCES})
 target_include_directories(SyncComms PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/external/miniaudio
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/json
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/json/single_include/nlohmann
     ${CMAKE_CURRENT_SOURCE_DIR}/external/imgui
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake
     ${CMAKE_CURRENT_SOURCE_DIR}/external/libogg/include
     ${CMAKE_CURRENT_SOURCE_DIR}/external/libogg/src
     ${CMAKE_CURRENT_SOURCE_DIR}/external/libvorbis/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/external/libvorbis/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/external/libvorbis/lib
     ${BAKKESMOD_SDK_PATH}/include
 )
 
