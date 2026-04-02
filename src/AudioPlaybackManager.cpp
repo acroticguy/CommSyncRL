@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
 #include <filesystem>
 
 namespace SyncComms {
@@ -68,6 +69,23 @@ void AudioPlaybackManager::SyncToReplayTime(float replayTimeSec) {
     }
     m_lastReplayTime = replayTimeSec;
 
+    // Debug: dump state to file on first call
+    static bool debugDumped = false;
+    if (!debugDumped && !m_segments.empty()) {
+        std::ofstream dbg("C:/Users/alexp/Desktop/synccomms_debug.txt");
+        dbg << "m_segments.size() = " << m_segments.size() << "\n";
+        dbg << "replayTimeSec = " << replayTimeSec << "\n";
+        for (size_t i = 0; i < m_segments.size(); i++) {
+            dbg << "seg[" << i << "] start=" << m_segments[i].startTimeSec
+                << " end=" << m_segments[i].endTimeSec
+                << " file=" << m_segments[i].audioFile << "\n";
+        }
+        int result = FindSegmentForTime(replayTimeSec);
+        dbg << "FindSegmentForTime result = " << result << "\n";
+        dbg.close();
+        debugDumped = true;
+    }
+
     // Determine which segment should be playing right now
     int shouldPlay = FindSegmentForTime(replayTimeSec);
 
@@ -82,6 +100,14 @@ void AudioPlaybackManager::SyncToReplayTime(float replayTimeSec) {
             const auto& seg = m_segments[shouldPlay];
             std::string fullPath = m_outputDir + seg.audioFile;
             bool opened = OpenDecoder(fullPath);
+
+            // Debug: log open attempt result
+            {
+                std::ofstream dbg("C:/Users/alexp/Desktop/synccomms_debug.txt", std::ios::app);
+                dbg << "OpenDecoder('" << fullPath << "') = " << (opened ? "OK" : "FAILED") << "\n";
+                dbg << "  file exists: " << std::filesystem::exists(fullPath) << "\n";
+                dbg.close();
+            }
 
             if (opened) {
                 m_currentSegIdx = shouldPlay;
@@ -213,15 +239,19 @@ bool AudioPlaybackManager::OpenDecoder(const std::string& audioFile) {
     if (!std::filesystem::exists(audioFile)) return false;
 
     m_decoder = new ma_decoder;
-    ma_decoder_config decoderConfig = ma_decoder_config_init(ma_format_f32,
-        static_cast<ma_uint32>(m_channels),
-        static_cast<ma_uint32>(m_sampleRate));
+
+    // Let miniaudio auto-detect format; only force float32 output
+    ma_decoder_config decoderConfig = ma_decoder_config_init(ma_format_f32, 0, 0);
 
     if (ma_decoder_init_file(audioFile.c_str(), &decoderConfig, m_decoder) != MA_SUCCESS) {
         delete m_decoder;
         m_decoder = nullptr;
         return false;
     }
+
+    // Update our playback params to match what the decoder actually outputs
+    m_sampleRate = static_cast<int>(m_decoder->outputSampleRate);
+    m_channels = static_cast<int>(m_decoder->outputChannels);
 
     m_decoderPosition = 0;
     return true;

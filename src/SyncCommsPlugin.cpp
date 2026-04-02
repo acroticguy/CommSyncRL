@@ -260,8 +260,7 @@ void SyncCommsPlugin::OnMatchEnded() {
                              m_currentReplayId);
 
             // Compress WAVs to OGG and embed in sidecar
-            // TODO: OGG compression disabled until playback bug is fixed
-            // m_sidecarManager->CompressSegments(m_currentReplayId, m_capturedSegments);
+            m_sidecarManager->CompressSegments(m_currentReplayId, m_capturedSegments);
         }
         m_capturedSegments.clear();
         m_currentReplayId.clear();
