@@ -5,6 +5,7 @@ build/
 dist/
 
 # Visual Studio
+*.vcxproj.filters
 *.vcxproj.user
 *.suo
 *.sdf
