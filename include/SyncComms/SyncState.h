@@ -14,6 +14,8 @@ struct SegmentInfo {
     int         endFrame;
     double      startTimeSec;   // server.GetSecondsElapsed() at capture start
     double      endTimeSec;     // server.GetSecondsElapsed() at capture end
+    double      goalTimeSec = -1.0; // capture-clock time of the GoalScored that
+                                    // ended this round; -1 = no goal closed it
     double      frameTime;      // seconds per replay frame (typically 1/30)
     std::string audioFile;      // relative path to audio file (WAV or OGG)
     std::string audioData;      // base64-encoded OGG data (embedded in JSON)

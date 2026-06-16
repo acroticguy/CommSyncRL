@@ -12,13 +12,18 @@ using json = nlohmann::json;
 
 namespace SyncComms {
 
-SidecarManager::SidecarManager(Config* config, std::shared_ptr<CVarManagerWrapper> cvarManager)
+SidecarManager::SidecarManager(Config* config, LogFn log)
     : m_config(config)
-    , m_cvarManager(std::move(cvarManager))
+    , m_log(std::move(log))
 {
 }
 
-bool SidecarManager::WriteSidecar(const std::string& replayId, const std::vector<SegmentInfo>& segments) {
+bool SidecarManager::WriteSidecar(const std::string& replayId,
+                                   const std::vector<SegmentInfo>& segments,
+                                   bool anchored,
+                                   const std::string& replayPath,
+                                   const std::string& anchorMode,
+                                   int64_t matchStartEpoch) {
     if (replayId.empty() || segments.empty()) return false;
 
     // Build timestamp
@@ -49,6 +54,9 @@ bool SidecarManager::WriteSidecar(const std::string& replayId, const std::vector
         s["durationSeconds"] = (seg.endFrame - seg.startFrame) * seg.frameTime;
         s["startTimeSec"] = seg.startTimeSec;
         s["endTimeSec"] = seg.endTimeSec;
+        if (seg.goalTimeSec >= 0.0) {
+            s["goalTimeSec"] = seg.goalTimeSec;
+        }
         if (!seg.audioData.empty()) {
             s["audioData"] = seg.audioData;
         }
@@ -60,43 +68,67 @@ bool SidecarManager::WriteSidecar(const std::string& replayId, const std::vector
     meta["pluginVersion"] = "1.0.0";
     j["metadata"] = meta;
 
-    // Write to file
+    // Anchoring metadata (added by post-match linker; absent on first write).
+    j["anchored"] = anchored;
+    if (!replayPath.empty()) j["replayPath"] = replayPath;
+    if (!anchorMode.empty()) j["anchorMode"] = anchorMode;
+    if (matchStartEpoch > 0) j["matchStartEpoch"] = matchStartEpoch;
+
+    // Atomic write: serialize to <path>.tmp, then rename onto the final path.
+    // PlaybackController reads sidecars; an in-progress write would otherwise
+    // be visible as truncated/invalid JSON.
     std::string path = BuildSidecarPath(replayId);
+    std::string tmpPath = path + ".tmp";
     std::filesystem::create_directories(std::filesystem::path(path).parent_path());
 
-    std::ofstream file(path);
-    if (!file.is_open()) return false;
+    {
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) return false;
+        file << j.dump(4);
+        if (!file.good()) return false;
+    }
 
-    file << j.dump(4);
-    return file.good();
+    std::error_code ec;
+    std::filesystem::rename(tmpPath, path, ec);
+    if (ec) {
+        // Some Windows configs disallow rename-over-existing. Try remove+rename.
+        std::filesystem::remove(path, ec);
+        std::filesystem::rename(tmpPath, path, ec);
+        if (ec) return false;
+    }
+    return true;
 }
 
-std::vector<SegmentInfo> SidecarManager::ReadSidecar(const std::string& filePath) {
-    std::vector<SegmentInfo> segments;
+SidecarReadResult SidecarManager::ReadSidecar(const std::string& filePath) {
+    SidecarReadResult result;
 
     std::ifstream file(filePath);
     if (!file.is_open()) {
-        if (m_cvarManager) m_cvarManager->log("SyncComms: Failed to open sidecar: " + filePath);
-        return segments;
+        if (m_log) m_log("SyncComms: Failed to open sidecar: " + filePath);
+        return result;
     }
 
     json j;
     try {
         file >> j;
     } catch (const std::exception& e) {
-        if (m_cvarManager) m_cvarManager->log("SyncComms: Failed to parse sidecar JSON: " + std::string(e.what()));
-        return segments;
+        if (m_log) m_log("SyncComms: Failed to parse sidecar JSON: " + std::string(e.what()));
+        return result;
     }
 
     if (!j.contains("version") || j["version"].get<int>() != 1) {
-        if (m_cvarManager) m_cvarManager->log("SyncComms: Unsupported sidecar version in " + filePath);
-        return segments;
+        if (m_log) m_log("SyncComms: Unsupported sidecar version in " + filePath);
+        return result;
     }
 
     double globalFrameTime = j.value("frameTime", 1.0 / 30.0);
+    result.frameTime  = globalFrameTime;
+    result.anchored   = j.value("anchored", false);
+    result.replayPath = j.value("replayPath", std::string{});
+    result.matchStartEpoch = j.value("matchStartEpoch", static_cast<int64_t>(0));
 
     if (!j.contains("segments") || !j["segments"].is_array()) {
-        return segments;
+        return result;
     }
 
     for (const auto& s : j["segments"]) {
@@ -107,13 +139,14 @@ std::vector<SegmentInfo> SidecarManager::ReadSidecar(const std::string& filePath
         seg.frameTime    = globalFrameTime;
         seg.startTimeSec = s.value("startTimeSec", 0.0);
         seg.endTimeSec   = s.value("endTimeSec", 0.0);
+        seg.goalTimeSec  = s.value("goalTimeSec", -1.0);
         seg.audioFile    = s.value("audioFile", "");
         seg.audioData    = s.value("audioData", "");
         seg.event        = s.value("event", "");
-        segments.push_back(seg);
+        result.segments.push_back(seg);
     }
 
-    return segments;
+    return result;
 }
 
 std::optional<std::string> SidecarManager::FindSidecar(const std::string& replayId) {
@@ -207,11 +240,11 @@ void SidecarManager::CompressSegments(const std::string& replayId, std::vector<S
         // Embed as base64 in the segment
         seg.audioData = AudioCompressor::Base64Encode(oggData);
 
-        if (m_cvarManager) {
+        if (m_log) {
             float ratio = static_cast<float>(std::filesystem::file_size(wavPath)) /
                           static_cast<float>(oggData.size());
-            m_cvarManager->log("SyncComms: Compressed " + seg.audioFile +
-                               " (" + std::to_string(ratio) + "x, embedded)");
+            m_log("SyncComms: Compressed " + seg.audioFile +
+                  " (" + std::to_string(ratio) + "x, embedded)");
         }
     }
 

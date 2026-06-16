@@ -5,6 +5,14 @@
 #include <vector>
 #include <string>
 
+// Real production code under test (pure, no BakkesMod/miniaudio deps).
+#include "SyncComms/SegmentAnchoring.h"
+#include "SyncComms/ReplayStallDetector.h"
+#include "SyncComms/ReplayMetadata.h"
+#include "SyncComms/RecordingMaintenance.h"
+#include <cstdlib>
+#include <filesystem>
+
 // Minimal reimplementation of sync math for testing (no BakkesMod/miniaudio deps)
 
 struct SegmentInfo {
@@ -242,6 +250,299 @@ void test_full_match_sync_accuracy() {
     printf("  [PASS] test_full_match_sync_accuracy\n");
 }
 
+// === Segment anchoring (SyncComms/SegmentAnchoring.h) ===
+
+namespace {
+
+const double kFt = 1.0 / 30.0;  // frameTime used throughout anchoring tests
+
+SyncComms::SegmentInfo MakeSeg(int index, double start, double end,
+                               double goal = -1.0) {
+    SyncComms::SegmentInfo s{};
+    s.index = index;
+    s.startTimeSec = start;
+    s.endTimeSec = end;
+    s.goalTimeSec = goal;
+    s.frameTime = kFt;
+    return s;
+}
+
+bool Near(double a, double b, double eps = 1e-6) {
+    return std::abs(a - b) < eps;
+}
+
+} // namespace
+
+void test_anchor_per_goal_equal_counts() {
+    // Replay goals at 55s, 120s, 180s. Capture clock lags by growing
+    // cinematic time: offsets should come out 1.0, 9.0, 16.0.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,   4.0,  57.5,  54.0),   // goal at replay 55s  -> offset  1.0
+        MakeSeg(1,  64.0, 114.5, 111.0),   // goal at replay 120s -> offset  9.0
+        MakeSeg(2, 122.0, 167.5, 164.0),   // goal at replay 180s -> offset 16.0
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 3600, 5400}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::PerGoal);
+    assert(plan.offsets.size() == 3);
+    assert(Near(plan.offsets[0], 1.0));
+    assert(Near(plan.offsets[1], 9.0));
+    assert(Near(plan.offsets[2], 16.0));
+    for (double r : plan.residuals) assert(Near(r, 0.0, 1e-9));
+    // Offsets only grow within a match (cinematics add wall-clock time).
+    for (size_t i = 1; i < plan.offsets.size(); ++i) {
+        assert(plan.offsets[i] >= plan.offsets[i - 1]);
+    }
+
+    SyncComms::ApplyAnchorPlan(segs, plan);
+    assert(Near(segs[0].goalTimeSec, 55.0));
+    assert(Near(segs[1].goalTimeSec, 120.0));
+    assert(Near(segs[2].goalTimeSec, 180.0));
+    assert(Near(segs[0].startTimeSec, 5.0));
+
+    printf("  [PASS] test_anchor_per_goal_equal_counts\n");
+}
+
+void test_anchor_trailing_unstamped_segment() {
+    // Match ended on the timer: last segment has no goal stamp and must
+    // inherit the previous segment's offset.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,   4.0,  57.5,  54.0),   // -> offset 1.0
+        MakeSeg(1,  64.0, 114.5, 111.0),   // -> offset 9.0
+        MakeSeg(2, 122.0, 200.0),          // no goal -> inherits 9.0
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 3600}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::PerGoal);
+    assert(Near(plan.offsets[0], 1.0));
+    assert(Near(plan.offsets[1], 9.0));
+    assert(Near(plan.offsets[2], 9.0));
+
+    SyncComms::ApplyAnchorPlan(segs, plan);
+    assert(Near(segs[2].startTimeSec, 131.0));
+    assert(Near(segs[2].goalTimeSec, -1.0));  // unstamped stays unstamped
+
+    printf("  [PASS] test_anchor_trailing_unstamped_segment\n");
+}
+
+void test_anchor_no_goals() {
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0, 4.0, 200.0),
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {}, kFt);
+    assert(plan.mode == SyncComms::AnchorMode::None);
+
+    SyncComms::ApplyAnchorPlan(segs, plan);  // must be a no-op
+    assert(Near(segs[0].startTimeSec, 4.0));
+
+    printf("  [PASS] test_anchor_no_goals\n");
+}
+
+void test_anchor_legacy_end_mode() {
+    // Pre-goal-stamp sidecar: no goalTimeSec anywhere. Each segment END is
+    // anchored to its goal frame — offsets are per-segment, not uniform.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,  4.0,  57.5),    // goal at 55s  -> offset -2.5
+        MakeSeg(1, 64.0, 114.0),    // goal at 120s -> offset  6.0
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 3600}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::LegacyEnd);
+    assert(Near(plan.offsets[0], -2.5));
+    assert(Near(plan.offsets[1], 6.0));
+    for (double r : plan.residuals) assert(Near(r, 0.0, 1e-9));
+
+    printf("  [PASS] test_anchor_legacy_end_mode\n");
+}
+
+void test_anchor_legacy_trailing_segment() {
+    // Legacy sidecar where the match ended on the timer: one more segment
+    // than goals. The trailing segment is goal-less; it inherits.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,   4.0,  57.5),
+        MakeSeg(1,  64.0, 114.0),
+        MakeSeg(2, 122.0, 199.0),
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 3600}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::LegacyEnd);
+    assert(Near(plan.offsets[0], -2.5));
+    assert(Near(plan.offsets[1], 6.0));
+    assert(Near(plan.offsets[2], 6.0));  // inherited
+
+    printf("  [PASS] test_anchor_legacy_trailing_segment\n");
+}
+
+void test_anchor_missing_early_segments() {
+    // Capture started mid-match: 2 stamped segments, 4 goals. Goal spacings
+    // (195s, 70s, 20s) make only the middle window consistent with the
+    // stamps' 58s spacing — steps of 137s and -38s are rejected as
+    // implausible cinematic gaps.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,  50.0, 103.0, 100.0),
+        MakeSeg(1, 110.0, 161.0, 158.0),
+    };
+    // goalSec = 55, 250, 320, 340
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 7500, 9600, 10200}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::PerGoal);
+    assert(Near(plan.offsets[0], 150.0));  // matched goals[1] (250s)
+    assert(Near(plan.offsets[1], 162.0));  // matched goals[2] (320s)
+    for (double r : plan.residuals) assert(Near(r, 0.0, 1e-9));
+
+    printf("  [PASS] test_anchor_missing_early_segments\n");
+}
+
+void test_anchor_ambiguous_falls_back_single_offset() {
+    // Evenly spaced goals (65s apart) make every window equally plausible
+    // for the stamps' 58s spacing — must degrade to one offset taken from
+    // the last stamp / last goal pair.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,  50.0, 103.0, 100.0),
+        MakeSeg(1, 110.0, 161.0, 158.0),
+    };
+    // goalSec = 55, 120, 185
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650, 3600, 5550}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::SingleOffset);
+    assert(Near(plan.offsets[0], 185.0 - 158.0));  // 27.0 from last pair
+    assert(Near(plan.offsets[1], 27.0));
+
+    printf("  [PASS] test_anchor_ambiguous_falls_back_single_offset\n");
+}
+
+void test_anchor_more_stamps_than_goals() {
+    // Header parse lost goals: 3 stamped segments, 1 goal. Degrade to a
+    // single offset from the first pair.
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0,   4.0,  57.5,  54.0),
+        MakeSeg(1,  64.0, 114.5, 111.0),
+        MakeSeg(2, 122.0, 167.5, 164.0),
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650}, kFt);
+
+    assert(plan.mode == SyncComms::AnchorMode::SingleOffset);
+    for (double o : plan.offsets) assert(Near(o, 1.0));
+
+    printf("  [PASS] test_anchor_more_stamps_than_goals\n");
+}
+
+void test_anchor_apply_shifts_goal_stamp() {
+    std::vector<SyncComms::SegmentInfo> segs = {
+        MakeSeg(0, 4.0, 57.5, 54.0),
+    };
+    auto plan = SyncComms::ComputeAnchorPlan(segs, {1650}, kFt);
+    assert(plan.mode == SyncComms::AnchorMode::PerGoal);
+
+    SyncComms::ApplyAnchorPlan(segs, plan);
+    assert(Near(segs[0].startTimeSec, 5.0));
+    assert(Near(segs[0].endTimeSec, 58.5));
+    assert(Near(segs[0].goalTimeSec, 55.0));  // stamp shifted too
+
+    printf("  [PASS] test_anchor_apply_shifts_goal_stamp\n");
+}
+
+// === Replay stall (pause) detection (SyncComms/ReplayStallDetector.h) ===
+
+void test_stall_detector_time_based() {
+    // 30Hz feed (Stats API PacketSendRate): pause must be detected after
+    // ~300ms of wall time, not after a fixed call count.
+    {
+        SyncComms::ReplayStallDetector d;
+        double now = 0.0;
+        float t = 5.0f;
+        // Advancing clock: never stalled.
+        for (int i = 0; i < 30; ++i) {
+            assert(!d.Update(t, now));
+            now += 1.0 / 30.0;
+            t += 1.0f / 30.0f;
+        }
+        // Clock freezes: stalled once >0.3s of wall time passes (~10 calls).
+        int callsUntilStall = 0;
+        while (!d.Update(t, now)) {
+            now += 1.0 / 30.0;
+            ++callsUntilStall;
+            assert(callsUntilStall < 12);
+        }
+        assert(callsUntilStall >= 9);
+        // First moving sample resumes immediately.
+        assert(!d.Update(t + 0.033f, now));
+    }
+    // 120Hz feed (BakkesMod tick): same ~300ms wall-time behavior.
+    {
+        SyncComms::ReplayStallDetector d;
+        double now = 0.0;
+        float t = 5.0f;
+        assert(!d.Update(t, now));
+        int callsUntilStall = 0;
+        while (!d.Update(t, now)) {
+            now += 1.0 / 120.0;
+            ++callsUntilStall;
+            assert(callsUntilStall < 40);
+        }
+        assert(callsUntilStall >= 36);
+    }
+
+    printf("  [PASS] test_stall_detector_time_based\n");
+}
+
+// === Recording retention predicate (SyncComms/RecordingMaintenance.h) ===
+
+void test_retention_predicate() {
+    using SyncComms::ShouldPruneUnbound;
+    const double kMax = 14.0;
+
+    // Bound recordings are kept regardless of age.
+    assert(!ShouldPruneUnbound(/*bound*/ true, /*age*/ 100.0, kMax));
+    assert(!ShouldPruneUnbound(true, 0.0, kMax));
+
+    // Unbound but still inside the window — kept.
+    assert(!ShouldPruneUnbound(false, 0.0, kMax));
+    assert(!ShouldPruneUnbound(false, 13.9, kMax));
+
+    // Boundary: exactly maxAge is NOT yet prunable (strictly-greater rule);
+    // a hair past it is.
+    assert(!ShouldPruneUnbound(false, 14.0, kMax));
+    assert(ShouldPruneUnbound(false, 14.001, kMax));
+
+    // Unbound and well past the window — pruned.
+    assert(ShouldPruneUnbound(false, 30.0, kMax));
+
+    // Default threshold is the 2-week retention constant.
+    assert(SyncComms::kRetentionDays == 14.0);
+    assert(ShouldPruneUnbound(false, 15.0));
+    assert(!ShouldPruneUnbound(false, 10.0));
+
+    printf("  [PASS] test_retention_predicate\n");
+}
+
+// === Real .replay header parse (guarded; opt-in via env var) ===
+// Set SYNCCOMMS_TEST_REPLAY=<path-to.replay> to run. Verifies the production
+// C++ parser (ReplayMetadata.cpp) extracts goalFrames from a real file — the
+// thing per-goal anchoring depends on. Skipped (PASS) when the env var is
+// unset so the suite stays hermetic.
+void test_real_replay_header_parse() {
+    const char* path = std::getenv("SYNCCOMMS_TEST_REPLAY");
+    if (!path || !*path) {
+        printf("  [SKIP] test_real_replay_header_parse (set SYNCCOMMS_TEST_REPLAY)\n");
+        return;
+    }
+    SyncComms::ReplayMetadata meta;
+    bool ok = SyncComms::ParseReplayHeader(std::filesystem::path(path), meta);
+    printf("    parsed=%d numFrames=%d goals=%zu matchStartEpoch=%lld "
+           "totalSecondsPlayed=%.1f recordFps=%.2f\n",
+           ok ? 1 : 0, meta.numFrames, meta.goalFrames.size(),
+           (long long)meta.matchStartEpoch, meta.totalSecondsPlayed, meta.recordFps);
+    if (!meta.goalFrames.empty()) {
+        printf("    goalFrames: ");
+        for (int f : meta.goalFrames) printf("%d ", f);
+        printf("\n");
+    }
+    // The whole anchoring pipeline needs goalFrames; assert we got some.
+    assert(!meta.goalFrames.empty());
+    printf("  [PASS] test_real_replay_header_parse\n");
+}
+
 int main() {
     printf("SyncComms Sync Algorithm Tests\n");
     printf("==============================\n");
@@ -254,6 +555,19 @@ int main() {
     test_resampler_2x_speed();
     test_resampler_half_speed();
     test_full_match_sync_accuracy();
+
+    test_anchor_per_goal_equal_counts();
+    test_anchor_trailing_unstamped_segment();
+    test_anchor_no_goals();
+    test_anchor_legacy_end_mode();
+    test_anchor_legacy_trailing_segment();
+    test_anchor_missing_early_segments();
+    test_anchor_ambiguous_falls_back_single_offset();
+    test_anchor_more_stamps_than_goals();
+    test_anchor_apply_shifts_goal_stamp();
+    test_stall_detector_time_based();
+    test_retention_predicate();
+    test_real_replay_header_parse();
 
     printf("\nAll tests passed!\n");
     return 0;

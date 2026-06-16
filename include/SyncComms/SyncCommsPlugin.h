@@ -4,6 +4,7 @@
 #include "bakkesmod/wrappers/canvaswrapper.h"
 #include "SyncComms/SyncState.h"
 #include "SyncComms/Config.h"
+#include "SyncComms/BakkesModConfig.h"
 #include "SyncComms/AudioCaptureManager.h"
 #include "SyncComms/AudioPlaybackManager.h"
 #include "SyncComms/SidecarManager.h"
@@ -48,7 +49,7 @@ private:
 
     // Owned components
     std::shared_ptr<SyncState>                  m_syncState;
-    std::unique_ptr<Config>                     m_config;
+    std::unique_ptr<BakkesModConfig>            m_config;
     std::unique_ptr<AudioCaptureManager>        m_captureManager;
     std::unique_ptr<AudioPlaybackManager>       m_playbackManager;
     std::unique_ptr<SidecarManager>             m_sidecarManager;

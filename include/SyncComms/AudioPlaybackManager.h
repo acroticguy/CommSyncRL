@@ -2,6 +2,7 @@
 
 #include "SyncComms/SyncState.h"
 #include "SyncComms/Config.h"
+#include "SyncComms/ReplayStallDetector.h"
 #include <memory>
 #include <vector>
 #include <string>
@@ -30,6 +31,15 @@ public:
     /// Called every game tick during replay viewing.
     /// Determines which segment should play and keeps audio locked to replay time.
     void SyncToReplayTime(float replayTimeSec);
+
+    /// Update one segment's startTimeSec without a full reload. Currently
+    /// unused — per-goal anchoring (SegmentAnchoring.h) supersedes the
+    /// CountdownBegin-snapping idea this was built for. Kept because it is
+    /// the only safe way to adjust a loaded segment's window in place.
+    /// Safe to call from the controller thread; m_segments is only read from
+    /// that thread (OnPlaybackData uses m_decoder / m_targetSample, not the
+    /// segment list).
+    void SetSegmentStart(int idx, double startTimeSec);
 
     /// Stop all playback and release resources.
     void StopPlayback();
@@ -75,9 +85,8 @@ private:
     std::vector<uint8_t> m_decoderBuffer;
 
     // Pause detection
-    float         m_lastReplayTime  = -1.0f;
-    int           m_staleTicks      = 0;
-    std::atomic<bool> m_paused{false};
+    ReplayStallDetector m_stallDetector;
+    std::atomic<bool>   m_paused{false};
 };
 
 } // namespace SyncComms

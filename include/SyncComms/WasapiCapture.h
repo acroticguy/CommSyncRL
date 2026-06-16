@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <mfobjects.h>   // IMFAsyncCallback / IMFAsyncResult
 
 #include <atomic>
 #include <functional>
@@ -13,7 +14,14 @@ namespace SyncComms {
 
 /// WASAPI-based audio capture supporting per-process loopback (Windows 10 2004+)
 /// and full system loopback as fallback.
-class WasapiCapture : public IActivateAudioInterfaceCompletionHandler {
+///
+/// Also implements IMFAsyncCallback: ActivateAudioInterfaceAsync for process
+/// loopback must run on a Media Foundation multithreaded work-queue thread
+/// (calling it on the app's own thread — even an MTA one — returns
+/// E_ILLEGAL_METHOD_CALL), so the activation is dispatched via MFPutWorkItem2
+/// and performed in Invoke().
+class WasapiCapture : public IActivateAudioInterfaceCompletionHandler,
+                      public IMFAsyncCallback {
 public:
     using DataCallback = std::function<void(const float*, uint32_t frameCount, int channels)>;
 
@@ -47,10 +55,19 @@ public:
     // IActivateAudioInterfaceCompletionHandler
     STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation* op) override;
 
+    // IMFAsyncCallback — Invoke runs the activation on an MF work-queue thread.
+    STDMETHOD(GetParameters)(DWORD* pdwFlags, DWORD* pdwQueue) override;
+    STDMETHOD(Invoke)(IMFAsyncResult* pAsyncResult) override;
+
 private:
-    bool StartPerProcessLoopback(uint32_t targetPid);
+    bool StartPerProcessLoopback(uint32_t targetPid, int sampleRate, int channels);
     bool StartFullLoopback();
-    bool SetupCaptureFromClient();
+    /// Initialize loopback capture on the already-activated m_audioClient with
+    /// `format`. If `takeOwnership` is true (full-loopback path, format came
+    /// from GetMixFormat / CoTaskMemAlloc), it's stored in m_captureFormat and
+    /// freed in Cleanup; if false (process-loopback path, caller owns a stack
+    /// format) it's used only for the Initialize call.
+    bool SetupCaptureFromClient(WAVEFORMATEX* format, bool takeOwnership);
     void CaptureThreadProc();
     void Cleanup();
 
@@ -71,6 +88,10 @@ private:
     int m_actualSampleRate = 0;
     int m_actualChannels   = 0;
     bool m_perProcessActive = false;
+
+    // Set before dispatching the activation work item; read in Invoke().
+    uint32_t m_pendingActivatePid = 0;
+    bool     m_mfStarted = false;
 };
 
 } // namespace SyncComms

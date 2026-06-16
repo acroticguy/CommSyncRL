@@ -22,3 +22,17 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+# Compiled object files (e.g. ad-hoc tools/loopback_smoke.cpp builds)
+*.obj
+
+# Python cache (tools/ diagnostic scripts)
+__pycache__/
+
+# Dev-Empire MCP server working state (not project source)
+.empire/
+
+# Raw Stats API capture dumps — large diagnostic data, regenerable, kept local
+tools/*.jsonl
+tools/*.csv
+tools/stats_api_text.txt

@@ -13,7 +13,7 @@ namespace SyncComms {
 
 void SyncCommsPlugin::onLoad() {
     // 1. Initialize config
-    m_config = std::make_unique<Config>(cvarManager);
+    m_config = std::make_unique<BakkesModConfig>(cvarManager);
     m_config->RegisterCVars();
 
     // 2. Create shared state
@@ -22,7 +22,10 @@ void SyncCommsPlugin::onLoad() {
     // 3. Create managers
     m_captureManager  = std::make_unique<AudioCaptureManager>(m_syncState, m_config.get());
     m_playbackManager = std::make_unique<AudioPlaybackManager>(m_syncState, m_config.get());
-    m_sidecarManager  = std::make_unique<SidecarManager>(m_config.get(), cvarManager);
+    auto cvarLog = [cv = cvarManager](const std::string& msg) {
+        if (cv) cv->log(msg);
+    };
+    m_sidecarManager  = std::make_unique<SidecarManager>(m_config.get(), cvarLog);
     m_uiOverlay       = std::make_unique<UIOverlay>(m_syncState, m_config.get());
 
     // 4. Register console commands
@@ -351,7 +354,7 @@ void SyncCommsPlugin::TryLoadReplayAudio() {
         return;
     }
 
-    auto segments = m_sidecarManager->ReadSidecar(sidecarPath.value());
+    auto segments = m_sidecarManager->ReadSidecar(sidecarPath.value()).segments;
     if (segments.empty()) {
         m_pendingReplayLoad = false;
         return;

@@ -3,11 +3,14 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
+#include <propsys.h>
+#include <Functiondiscoverykeys_devpkey.h>
 #include <psapi.h>
 #include <algorithm>
 #include <cctype>
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "propsys.lib")
 
 namespace SyncComms {
 
@@ -141,6 +144,92 @@ std::vector<AudioProcessInfo> AudioSessionEnumerator::GetActiveAudioProcesses() 
     deviceEnum->Release();
     if (comInitialized) CoUninitialize();
 
+    return result;
+}
+
+std::vector<MicrophoneInfo> AudioSessionEnumerator::GetMicrophones() {
+    std::vector<MicrophoneInfo> result;
+
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool comInitialized = SUCCEEDED(hrCom);
+
+    IMMDeviceEnumerator* deviceEnum = nullptr;
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&deviceEnum));
+    if (FAILED(hr) || !deviceEnum) {
+        if (comInitialized) CoUninitialize();
+        return result;
+    }
+
+    // Resolve default communications endpoint id so we can flag it later.
+    // We use eCommunications (not eConsole) because comms is what voice apps
+    // like Discord pick by default — and that matches the user's intuition
+    // for "what's my mic?".
+    std::string defaultId;
+    {
+        IMMDevice* def = nullptr;
+        if (SUCCEEDED(deviceEnum->GetDefaultAudioEndpoint(eCapture, eCommunications, &def)) && def) {
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(def->GetId(&id)) && id) {
+                defaultId = WideToUtf8(id);
+                CoTaskMemFree(id);
+            }
+            def->Release();
+        }
+    }
+
+    IMMDeviceCollection* devices = nullptr;
+    if (FAILED(deviceEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &devices)) || !devices) {
+        deviceEnum->Release();
+        if (comInitialized) CoUninitialize();
+        return result;
+    }
+
+    UINT count = 0;
+    devices->GetCount(&count);
+
+    for (UINT i = 0; i < count; ++i) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(devices->Item(i, &dev)) || !dev) continue;
+
+        MicrophoneInfo info;
+
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(dev->GetId(&id)) && id) {
+            info.deviceId = WideToUtf8(id);
+            CoTaskMemFree(id);
+        }
+
+        IPropertyStore* props = nullptr;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
+            PROPVARIANT var;
+            PropVariantInit(&var);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &var)) &&
+                var.vt == VT_LPWSTR && var.pwszVal) {
+                info.friendlyName = WideToUtf8(var.pwszVal);
+            }
+            PropVariantClear(&var);
+            props->Release();
+        }
+
+        info.isDefault = !defaultId.empty() && info.deviceId == defaultId;
+
+        if (!info.deviceId.empty()) {
+            result.push_back(std::move(info));
+        }
+        dev->Release();
+    }
+
+    devices->Release();
+    deviceEnum->Release();
+    if (comInitialized) CoUninitialize();
+
+    // Sort: default first, then alphabetical by friendly name.
+    std::sort(result.begin(), result.end(), [](const MicrophoneInfo& a, const MicrophoneInfo& b) {
+        if (a.isDefault != b.isDefault) return a.isDefault;
+        return a.friendlyName < b.friendlyName;
+    });
     return result;
 }
 

@@ -6,9 +6,13 @@
 #include <audioclient.h>
 #include <avrt.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <mfapi.h>   // MFStartup / MFPutWorkItem2 / MFASYNC_CALLBACK_QUEUE_MULTITHREADED
 
+#include <iostream>
 #include <vector>
 #include <cstring>
+
+#pragma comment(lib, "mfplat.lib")
 
 // Per-process loopback structures (Windows 10 2004+ / SDK 10.0.19041+)
 #ifndef AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
@@ -42,6 +46,9 @@ namespace SyncComms {
 
 WasapiCapture::WasapiCapture() {
     m_activationCompleteEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    // Needed so MFPutWorkItem2 has a running work-queue system. Ref-counted by
+    // MF, so it's safe even if the host already called MFStartup.
+    m_mfStarted = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
 }
 
 WasapiCapture::~WasapiCapture() {
@@ -50,18 +57,72 @@ WasapiCapture::~WasapiCapture() {
         CloseHandle(m_activationCompleteEvent);
         m_activationCompleteEvent = nullptr;
     }
+    if (m_mfStarted) {
+        MFShutdown();
+        m_mfStarted = false;
+    }
 }
 
 // IUnknown
 HRESULT STDMETHODCALLTYPE WasapiCapture::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
-    if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+        // Disambiguate the IUnknown diamond via the activation-handler base.
         *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
-        AddRef();
-        return S_OK;
+    } else if (riid == __uuidof(IMFAsyncCallback)) {
+        *ppv = static_cast<IMFAsyncCallback*>(this);
+    } else if (riid == __uuidof(IAgileObject)) {
+        // ActivateAudioInterfaceAsync requires the completion handler to be
+        // agile (the MS WinRT sample's handler is, ours must say so too or the
+        // call returns E_ILLEGAL_METHOD_CALL). IAgileObject is a marker with no
+        // methods, so any valid IUnknown for this object satisfies it.
+        *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+    } else {
+        *ppv = nullptr;
+        return E_NOINTERFACE;
     }
-    *ppv = nullptr;
-    return E_NOINTERFACE;
+    AddRef();
+    return S_OK;
+}
+
+// IMFAsyncCallback
+HRESULT STDMETHODCALLTYPE WasapiCapture::GetParameters(DWORD*, DWORD*) {
+    return E_NOTIMPL;  // use default queue/flags
+}
+
+// Runs on an MF multithreaded work-queue thread — the required context for
+// ActivateAudioInterfaceAsync with the process-loopback virtual device.
+HRESULT STDMETHODCALLTYPE WasapiCapture::Invoke(IMFAsyncResult*) {
+    AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
+    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+    activationParams.ProcessLoopbackParams.TargetProcessId = m_pendingActivatePid;
+    activationParams.ProcessLoopbackParams.ProcessLoopbackMode =
+        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+    PROPVARIANT activateParams = {};
+    activateParams.vt = VT_BLOB;
+    activateParams.blob.cbSize = sizeof(activationParams);
+    activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
+
+    IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
+    HRESULT hr = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        __uuidof(IAudioClient),
+        &activateParams,
+        static_cast<IActivateAudioInterfaceCompletionHandler*>(this),
+        &asyncOp);
+    if (asyncOp) asyncOp->Release();
+
+    // On synchronous failure, ActivateCompleted won't fire — signal here so the
+    // waiting Start() thread doesn't time out.
+    if (FAILED(hr)) {
+        std::cerr << "[WasapiCapture] ActivateAudioInterfaceAsync failed hr=0x"
+                  << std::hex << hr << std::dec << "\n";
+        m_activationResult = hr;
+        SetEvent(m_activationCompleteEvent);
+    }
+    return S_OK;
 }
 
 ULONG STDMETHODCALLTYPE WasapiCapture::AddRef() {
@@ -101,55 +162,90 @@ bool WasapiCapture::Start(uint32_t targetPid, int requestedSampleRate, int reque
     if (m_running) return false;
     m_callback = std::move(callback);
 
-    // Try per-process loopback first
-    if (targetPid > 0 && StartPerProcessLoopback(targetPid)) {
-        m_perProcessActive = true;
-        return true;
+    const int sampleRate = requestedSampleRate > 0 ? requestedSampleRate : 48000;
+    const int channels   = requestedChannels   > 0 ? requestedChannels   : 2;
+
+    // Try per-process loopback first (isolates the selected app's audio).
+    if (targetPid > 0) {
+        if (StartPerProcessLoopback(targetPid, sampleRate, channels)) {
+            m_perProcessActive = true;
+            std::cerr << "[WasapiCapture] per-process loopback ACTIVE for pid "
+                      << targetPid << " (" << m_actualSampleRate << "Hz/"
+                      << m_actualChannels << "ch)\n";
+            return true;
+        }
+        // Loud: a target WAS requested but isolation failed. Falling back to
+        // full-system loopback means we record the ENTIRE mix (game + comms +
+        // everything), which is almost never what the user wanted.
+        std::cerr << "[WasapiCapture] WARNING: per-process loopback FAILED for pid "
+                  << targetPid << " — falling back to FULL-SYSTEM capture "
+                     "(you will hear game audio + everything, not just the "
+                     "selected app)\n";
+    } else {
+        std::cerr << "[WasapiCapture] no target pid — using full-system loopback\n";
     }
 
     // Fallback to full system loopback
     m_perProcessActive = false;
-    return StartFullLoopback();
+    bool ok = StartFullLoopback();
+    std::cerr << "[WasapiCapture] full-system loopback "
+              << (ok ? "active" : "FAILED") << "\n";
+    return ok;
 }
 
-bool WasapiCapture::StartPerProcessLoopback(uint32_t targetPid) {
-    // Set up activation params
-    AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
-    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = targetPid;
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode =
-        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
-
-    PROPVARIANT activateParams = {};
-    activateParams.vt = VT_BLOB;
-    activateParams.blob.cbSize = sizeof(activationParams);
-    activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
-
-    // Reset activation state
+bool WasapiCapture::StartPerProcessLoopback(uint32_t targetPid, int sampleRate, int channels) {
+    // Reset activation state and stash the pid for Invoke().
     m_activationResult = E_FAIL;
     m_audioClient = nullptr;
+    m_pendingActivatePid = targetPid;
     ResetEvent(m_activationCompleteEvent);
 
-    IActivateAudioInterfaceAsyncOperation* asyncOp = nullptr;
-    HRESULT hr = ActivateAudioInterfaceAsync(
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-        __uuidof(IAudioClient),
-        &activateParams,
-        static_cast<IActivateAudioInterfaceCompletionHandler*>(this),
-        &asyncOp);
-
-    if (FAILED(hr)) return false;
+    // ActivateAudioInterfaceAsync for process loopback must be issued from an
+    // MF multithreaded work-queue thread (otherwise E_ILLEGAL_METHOD_CALL).
+    // Dispatch Invoke() there; it calls ActivateAudioInterfaceAsync and the
+    // result arrives in ActivateCompleted, which signals m_activationCompleteEvent.
+    HRESULT hr = MFPutWorkItem2(MFASYNC_CALLBACK_QUEUE_MULTITHREADED, 0,
+                                static_cast<IMFAsyncCallback*>(this), nullptr);
+    if (FAILED(hr)) {
+        std::cerr << "[WasapiCapture] MFPutWorkItem2 failed hr=0x"
+                  << std::hex << hr << std::dec << "\n";
+        return false;
+    }
 
     // Wait for activation to complete (5 second timeout)
     DWORD waitResult = WaitForSingleObject(m_activationCompleteEvent, 5000);
-    if (asyncOp) asyncOp->Release();
 
     if (waitResult != WAIT_OBJECT_0 || FAILED(m_activationResult) || !m_audioClient) {
+        std::cerr << "[WasapiCapture] process-loopback activation failed (wait="
+                  << waitResult << " result=0x" << std::hex << m_activationResult
+                  << std::dec << ")\n";
         Cleanup();
         return false;
     }
 
-    return SetupCaptureFromClient();
+    // CRITICAL: the process-loopback virtual device does NOT support
+    // GetMixFormat() — calling it (as the full-loopback path does) fails and
+    // is what silently dropped us to full-system capture. Supply a fixed
+    // float32 format instead, matching Microsoft's ApplicationLoopback sample.
+    // The virtual device converts the app's audio to this format for us.
+    //
+    // Force STEREO regardless of the config's channel count: stereo float32 is
+    // the most reliably-accepted loopback format, and the pipeline keys off
+    // GetActualChannels() anyway (the old full-loopback path captured at the
+    // endpoint's mix format, which is stereo) — so this changes nothing
+    // downstream while avoiding a mono-format rejection that would silently
+    // fall back to full-system capture.
+    (void)channels;
+    WAVEFORMATEX fmt = {};
+    fmt.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
+    fmt.nChannels       = 2;
+    fmt.nSamplesPerSec  = static_cast<DWORD>(sampleRate);
+    fmt.wBitsPerSample  = 32;
+    fmt.nBlockAlign     = static_cast<WORD>((fmt.nChannels * fmt.wBitsPerSample) / 8);
+    fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
+    fmt.cbSize          = 0;
+
+    return SetupCaptureFromClient(&fmt, /*takeOwnership=*/false);
 }
 
 bool WasapiCapture::StartFullLoopback() {
@@ -181,29 +277,37 @@ bool WasapiCapture::StartFullLoopback() {
 
     if (FAILED(hr) || !m_audioClient) return false;
 
-    return SetupCaptureFromClient();
-}
-
-bool WasapiCapture::SetupCaptureFromClient() {
-    if (!m_audioClient) return false;
-
-    // Get the mix format
-    HRESULT hr = m_audioClient->GetMixFormat(&m_captureFormat);
-    if (FAILED(hr) || !m_captureFormat) {
+    // Real render endpoint DOES support GetMixFormat (usually float32). The
+    // returned format is CoTaskMemAlloc'd, so SetupCaptureFromClient takes
+    // ownership and frees it in Cleanup.
+    WAVEFORMATEX* mixFormat = nullptr;
+    hr = m_audioClient->GetMixFormat(&mixFormat);
+    if (FAILED(hr) || !mixFormat) {
         Cleanup();
         return false;
     }
+    return SetupCaptureFromClient(mixFormat, /*takeOwnership=*/true);
+}
 
-    m_actualSampleRate = static_cast<int>(m_captureFormat->nSamplesPerSec);
-    m_actualChannels = static_cast<int>(m_captureFormat->nChannels);
+bool WasapiCapture::SetupCaptureFromClient(WAVEFORMATEX* format, bool takeOwnership) {
+    if (!m_audioClient || !format) return false;
 
-    // Initialize shared-mode loopback with event-driven buffering
-    hr = m_audioClient->Initialize(
+    if (takeOwnership) m_captureFormat = format;  // CoTaskMemFree'd in Cleanup
+
+    m_actualSampleRate = static_cast<int>(format->nSamplesPerSec);
+    m_actualChannels   = static_cast<int>(format->nChannels);
+
+    // Initialize shared-mode loopback with event-driven buffering. Same flags
+    // for both paths; only the format source differs (fixed for process
+    // loopback, GetMixFormat for full loopback).
+    HRESULT hr = m_audioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        0, 0, m_captureFormat, nullptr);
+        0, 0, format, nullptr);
 
     if (FAILED(hr)) {
+        std::cerr << "[WasapiCapture] IAudioClient::Initialize failed hr=0x"
+                  << std::hex << hr << std::dec << "\n";
         Cleanup();
         return false;
     }

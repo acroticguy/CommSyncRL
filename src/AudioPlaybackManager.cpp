@@ -1,6 +1,7 @@
 #include "SyncComms/AudioPlaybackManager.h"
 #include "SyncComms/AudioCompressor.h"
 #include "miniaudio.h"
+#include <chrono>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -30,16 +31,12 @@ void AudioPlaybackManager::LoadSegments(const std::vector<SegmentInfo>& segments
     m_segments = segments;
     m_outputDir = m_config->GetOutputDir();
     m_currentSegIdx = -1;
-
-    if (!m_deviceReady) {
-        if (InitPlaybackDevice()) {
-            if (ma_device_start(m_device) == MA_SUCCESS) {
-                m_deviceReady = true;
-            } else {
-                DestroyPlaybackDevice();
-            }
-        }
-    }
+    // Don't init the playback device here — we need to know the captured
+    // OGG's actual sample rate and channel count first. Device is initialized
+    // lazily in SyncToReplayTime once a decoder is opened, so its format
+    // matches the audio it'll be playing. (Capture's WASAPI side picks the
+    // hardware's natural format, often 48kHz/2ch — Config::GetChannels()
+    // defaults to 1 and would produce a buffer-size mismatch if used here.)
 }
 
 int AudioPlaybackManager::FindSegmentForTime(float replayTimeSec) const {
@@ -47,7 +44,12 @@ int AudioPlaybackManager::FindSegmentForTime(float replayTimeSec) const {
         const auto& seg = m_segments[i];
         float start = static_cast<float>(seg.startTimeSec);
         float end = static_cast<float>(seg.endTimeSec);
-        if (start > 0.0f && end > 0.0f) {
+        // A valid segment just needs positive width. start may be <= 0: per-goal
+        // anchoring can place the FIRST segment's window a hair before replay
+        // frame 0 (e.g. start=-0.39s), since the round began at the very start
+        // of the recording. The old `start > 0` guard silently dropped that
+        // first segment, so it never played ("between segments" forever).
+        if (end > start) {
             if (replayTimeSec >= start - 0.2f && replayTimeSec <= end + 0.2f) {
                 return i;
             }
@@ -57,17 +59,20 @@ int AudioPlaybackManager::FindSegmentForTime(float replayTimeSec) const {
 }
 
 void AudioPlaybackManager::SyncToReplayTime(float replayTimeSec) {
-    // Pause detection: if replay time hasn't changed, we're paused
-    if (std::abs(replayTimeSec - m_lastReplayTime) < 0.001f) {
-        m_staleTicks++;
-        if (m_staleTicks > 30) {
-            m_paused.store(true);
-        }
-    } else {
-        m_staleTicks = 0;
-        m_paused.store(false);
-    }
-    m_lastReplayTime = replayTimeSec;
+    // Pause detection: if replay time hasn't progressed for ~300ms of wall
+    // time, the replay is paused. Time-based so 30Hz and 120Hz callers
+    // silence equally fast.
+    const double nowSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_paused.store(m_stallDetector.Update(replayTimeSec, nowSec));
+
+    // Constant A/V latency trim. POSITIVE = play audio LATER (delay it): we
+    // read from an earlier point in the segment for a given replay time, so the
+    // sound lands behind the picture. Read live from config each tick
+    // (StandaloneConfig defaults to +100ms; the BakkesMod build defaults to 0).
+    // Segment SELECTION stays on the raw replay time — 100ms is well within the
+    // ±0.2s window tolerance, so the trim only shifts the audio read position.
+    const float latencySec = m_config->GetLatencyOffsetMs() / 1000.0f;
 
     // Determine which segment should be playing right now
     int shouldPlay = FindSegmentForTime(replayTimeSec);
@@ -98,8 +103,24 @@ void AudioPlaybackManager::SyncToReplayTime(float replayTimeSec) {
                 m_segmentStartReplayTime = static_cast<float>(seg.startTimeSec);
                 m_syncState->activeSegmentIndex.store(shouldPlay);
 
+                // First decoder open of this playback session — initialize
+                // the device with the decoder's actual sample rate / channel
+                // count. (OpenDecoder*() updated m_sampleRate and m_channels
+                // from the decoder's outputs.)
+                if (!m_deviceReady) {
+                    if (InitPlaybackDevice() &&
+                        ma_device_start(m_device) == MA_SUCCESS) {
+                        m_deviceReady = true;
+                    } else {
+                        DestroyPlaybackDevice();
+                        CloseDecoder();
+                        m_currentSegIdx = -1;
+                        return;
+                    }
+                }
+
                 // Seek to the right position within the segment
-                float elapsed = replayTimeSec - m_segmentStartReplayTime;
+                float elapsed = replayTimeSec - m_segmentStartReplayTime - latencySec;
                 if (elapsed < 0.0f) elapsed = 0.0f;
                 int64_t target = static_cast<int64_t>(elapsed * m_sampleRate);
                 ma_decoder_seek_to_pcm_frame(m_decoder, static_cast<ma_uint64>(target));
@@ -109,12 +130,35 @@ void AudioPlaybackManager::SyncToReplayTime(float replayTimeSec) {
                 m_playing.store(true);
             }
         }
-    } else if (m_playing.load()) {
-        // Same segment — update target sample for time-lock
-        float elapsed = replayTimeSec - m_segmentStartReplayTime;
+    } else if (m_decoder) {
+        // Same segment, decoder still open — keep target locked to replay
+        // time even if we previously hit EOF (m_playing == false). On a
+        // backward scrub, target < m_decoderPosition; re-arming m_playing
+        // lets OnPlaybackData's drift-seek path jump the decoder back.
+        float elapsed = replayTimeSec - m_segmentStartReplayTime - latencySec;
         if (elapsed < 0.0f) elapsed = 0.0f;
         int64_t target = static_cast<int64_t>(elapsed * m_sampleRate);
         m_targetSample.store(target, std::memory_order_relaxed);
+        if (!m_playing.load(std::memory_order_relaxed)) {
+            m_playing.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
+void AudioPlaybackManager::SetSegmentStart(int idx, double startTimeSec) {
+    if (idx < 0 || idx >= static_cast<int>(m_segments.size())) return;
+    const float prevStart = static_cast<float>(m_segments[idx].startTimeSec);
+    const float newStart  = static_cast<float>(startTimeSec);
+    // Width is preserved relative to the existing endTimeSec — this is a
+    // start-only update, intended for snapping a not-yet-played segment to
+    // its observed kickoff frame.
+    m_segments[idx].startTimeSec = startTimeSec;
+    if (idx == m_currentSegIdx && std::abs(prevStart - newStart) > 0.001f) {
+        // We're already inside this segment when the kickoff event lands.
+        // Update the in-flight reference; the next SyncToReplayTime tick
+        // will recompute m_targetSample against the new origin and the
+        // audio thread's drift-seek will catch up.
+        m_segmentStartReplayTime = newStart;
     }
 }
 
@@ -128,8 +172,7 @@ void AudioPlaybackManager::StopPlayback() {
     }
     DestroyPlaybackDevice();
     m_deviceReady = false;
-    m_lastReplayTime = -1.0f;
-    m_staleTicks = 0;
+    m_stallDetector.Reset();
 }
 
 void AudioPlaybackManager::OnPlaybackData(float* output, uint32_t frameCount) {
@@ -151,7 +194,9 @@ void AudioPlaybackManager::OnPlaybackData(float* output, uint32_t frameCount) {
     int64_t drift = target - m_decoderPosition;
 
     if (std::abs(drift) > m_sampleRate / 10) { // >100ms drift = seek
-        if (target >= 0) {
+        ma_uint64 totalFrames = 0;
+        bool haveLength = ma_decoder_get_length_in_pcm_frames(m_decoder, &totalFrames) == MA_SUCCESS;
+        if (target >= 0 && (!haveLength || static_cast<ma_uint64>(target) < totalFrames)) {
             ma_decoder_seek_to_pcm_frame(m_decoder, static_cast<ma_uint64>(target));
             m_decoderPosition = target;
         }
